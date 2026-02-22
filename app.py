@@ -1,31 +1,7 @@
-"""
-Production Telegram Bot with Webhook Mode using Flask
-
-DEPLOYMENT INSTRUCTIONS FOR RENDER:
-
-1. Push this project to GitHub
-2. Create new Web Service on Render.com
-3. Connect your GitHub repository
-4. Set Build Command: pip install -r requirements.txt
-5. Set Start Command: python app.py
-6. Add Environment Variables:
-   - BOT_TOKEN: your telegram bot token
-   - WEBHOOK_URL: https://your-app-name.onrender.com/webhook
-   - ADMIN_ID: telegram user id for admin
-   - DB_HOST: your postgres host
-   - DB_PORT: 5432
-   - DB_NAME: your database name
-   - DB_USER: your database user
-   - DB_PASSWORD: your database password
-   - PORT: 8000 (or leave empty, Render sets this automatically)
-7. Deploy!
-
-The bot will automatically set webhook on startup.
-"""
-
+import asyncio
 import logging
 import os
-import asyncio
+import threading
 from flask import Flask, request, Response
 from telegram import Update
 from telegram.ext import Application, CommandHandler
@@ -49,11 +25,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+"""
+Alwaysdata WSGI entry point:
+Expose the Flask instance as `application`.
+"""
+
 # Initialize Flask app
-app = Flask(__name__)
+application = Flask(__name__)
 
 # Initialize Telegram Application (global)
-application = None
+telegram_app = None
+event_loop = None
+loop_thread = None
 
 
 def setup_application() -> Application:
@@ -80,16 +63,19 @@ def setup_application() -> Application:
     return telegram_app
 
 
-@app.route("/webhook", methods=["POST"])
+@application.route("/webhook", methods=["POST"])
 def webhook():
     """Handle incoming webhook updates from Telegram."""
     try:
         # Parse incoming update
         update_data = request.get_json(force=True)
-        update = Update.de_json(update_data, application.bot)
+        update = Update.de_json(update_data, telegram_app.bot)
         
-        # Process update asynchronously
-        asyncio.run(application.process_update(update))
+        # Process update asynchronously on the bot event loop
+        future = asyncio.run_coroutine_threadsafe(
+            telegram_app.process_update(update), event_loop
+        )
+        future.result()
         
         logger.info(f"Processed update: {update.update_id}")
         return Response(status=200)
@@ -99,13 +85,13 @@ def webhook():
         return Response(status=500)
 
 
-@app.route("/")
+@application.route("/")
 def index():
     """Health check endpoint."""
     return "Telegram Bot is running!"
 
 
-@app.route("/health")
+@application.route("/health")
 def health():
     """Health check for monitoring."""
     return {"status": "ok", "bot": "running"}
@@ -115,8 +101,8 @@ async def setup_webhook():
     """Set up the webhook for Telegram."""
     try:
         logger.info(f"Setting webhook to: {WEBHOOK_URL}")
-        await application.bot.set_webhook(url=WEBHOOK_URL)
-        webhook_info = await application.bot.get_webhook_info()
+        await telegram_app.bot.set_webhook(url=WEBHOOK_URL)
+        webhook_info = await telegram_app.bot.get_webhook_info()
         logger.info(f"Webhook set successfully: {webhook_info.url}")
     except Exception as e:
         logger.error(f"Failed to set webhook: {e}")
@@ -127,41 +113,47 @@ async def remove_webhook():
     """Remove webhook on shutdown."""
     try:
         logger.info("Removing webhook...")
-        await application.bot.delete_webhook()
+        await telegram_app.bot.delete_webhook()
         logger.info("Webhook removed")
     except Exception as e:
         logger.error(f"Failed to remove webhook: {e}")
 
 
+def _start_event_loop(loop: asyncio.AbstractEventLoop) -> None:
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+
+
 def main():
     """Main function to start the Flask application."""
-    global application
+    global telegram_app, event_loop, loop_thread
     
     logger.info("Starting Telegram bot in webhook mode...")
     
     # Setup application
-    application = setup_application()
+    telegram_app = setup_application()
     
-    # Initialize application (required for async operations)
-    import asyncio
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(application.initialize())
-    loop.run_until_complete(setup_webhook())
+    # Start background event loop
+    event_loop = asyncio.new_event_loop()
+    loop_thread = threading.Thread(target=_start_event_loop, args=(event_loop,), daemon=True)
+    loop_thread.start()
+
+    # Initialize and start the application
+    asyncio.run_coroutine_threadsafe(telegram_app.initialize(), event_loop).result()
+    asyncio.run_coroutine_threadsafe(telegram_app.start(), event_loop).result()
+    asyncio.run_coroutine_threadsafe(setup_webhook(), event_loop).result()
     
     logger.info(f"Starting Flask server on port {PORT}...")
     
     try:
         # Run Flask app
-        app.run(host="0.0.0.0", port=PORT, debug=False)
+        application.run(host="0.0.0.0", port=PORT, debug=False)
     except KeyboardInterrupt:
         logger.info("Shutting down...")
     finally:
         # Cleanup
-        loop.run_until_complete(remove_webhook())
-        loop.run_until_complete(application.shutdown())
-        loop.close()
-
-
-if __name__ == "__main__":
-    main()
+        asyncio.run_coroutine_threadsafe(remove_webhook(), event_loop).result()
+        asyncio.run_coroutine_threadsafe(telegram_app.stop(), event_loop).result()
+        asyncio.run_coroutine_threadsafe(telegram_app.shutdown(), event_loop).result()
+        event_loop.call_soon_threadsafe(event_loop.stop)
+        loop_thread.join(timeout=5)

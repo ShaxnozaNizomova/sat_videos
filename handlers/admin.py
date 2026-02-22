@@ -1,3 +1,5 @@
+import asyncio
+
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -97,6 +99,7 @@ async def add_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
         except Exception:
             pass
+        await asyncio.sleep(0.05)
 
     return ConversationHandler.END
 
